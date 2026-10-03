@@ -192,6 +192,20 @@ describe_pairs() { # pairs on stdin -> "default" | "Alt/Win swapped" | "custom"
 
 cmd_list() {
   local v p t prod tag seen=" "
+  if [ "${1:-}" = "--plain" ]; then
+    # Machine-readable, connected keyboards only: VID:PID<TAB>transport<TAB>state<TAB>product
+    # state is default | swapped | custom
+    while read -r v p t prod; do
+      [ -n "$v" ] || continue
+      case "$(saved_pairs "$(pref_key "$v" "$p")" | describe_pairs)" in
+        default) tag=default ;; "Alt/Win swapped") tag=swapped ;; *) tag=custom ;;
+      esac
+      printf '%s\t%s\t%s\t%s\n' "$v:$p" "$t" "$tag" "$prod"
+    done <<EOF
+$(connected_keyboards)
+EOF
+    return 0
+  fi
   info "Connected keyboards:"
   while read -r v p t prod; do
     [ -n "$v" ] || continue
@@ -342,7 +356,7 @@ kbswap $VERSION — Mac modifier layout for Windows-layout keyboards, per keyboa
 Usage: kbswap [--dry-run] <command> [args]
 
 Commands:
-  list                       Show connected keyboards (VID:PID) and their saved mappings
+  list [--plain]             Show connected keyboards (VID:PID) and their saved mappings
   enable VID:PID [--force]   Swap Alt<->Command and Win<->Option on that keyboard
   disable VID:PID [--force]  Undo; restores any mapping kbswap replaced
   apply                      Re-apply saved swaps to connected keyboards right now
@@ -359,7 +373,7 @@ main() {
   local cmd="${1:-help}"
   [ $# -eq 0 ] || shift
   case "$cmd" in
-    list) cmd_list ;;
+    list) cmd_list "$@" ;;
     enable) cmd_enable "$@" ;;
     disable) cmd_disable "$@" ;;
     apply) cmd_apply ;;

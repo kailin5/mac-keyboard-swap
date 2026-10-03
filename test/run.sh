@@ -131,6 +131,17 @@ test_dry_run_changes_nothing() {
   check "dry-run: nothing live" "" "$(live)"
 }
 
+test_list_plain() {
+  "$KBSWAP" enable "$VID:$PID" >/dev/null
+  check "list --plain" "$(printf "%s\t%s\t%s\t%s" "$VID:$PID" USB swapped "Test Keyboard")" "$("$KBSWAP" list --plain)"
+}
+
+test_install_script_with_ids() {
+  KBSWAP_BIN_DIR="$WORK/bin" "$ROOT/install.sh" "$VID:$PID" >/dev/null
+  check "install: binary" "yes" "$([ -x "$WORK/bin/kbswap" ] && echo yes || echo no)"
+  check "install: enabled" "$SWAP" "$(saved)"
+}
+
 test_bad_id() {
   "$KBSWAP" enable nonsense >/dev/null 2>&1
   check "bad id: exit non-zero" "1" "$?"

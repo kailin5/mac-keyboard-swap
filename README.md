@@ -16,11 +16,21 @@ line, so you can script it and reproduce it on a new Mac.
 
 ## Install
 
+One line. It installs `kbswap` to `~/.local/bin`, then asks y/N for each connected
+non-Apple keyboard that has no mapping yet:
+
 ```sh
-git clone https://github.com/kailin5/mac-keyboard-swap.git
-cd mac-keyboard-swap
-make install            # symlinks bin/kbswap into /usr/local/bin (PREFIX=... to change)
+curl -fsSL https://raw.githubusercontent.com/kailin5/mac-keyboard-swap/main/install.sh | bash
 ```
+
+Already know the keyboard (dotfiles, new Mac)? Pass its `VID:PID` and nothing is asked:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kailin5/mac-keyboard-swap/main/install.sh | bash -s -- 1133:50475
+```
+
+The script is short; [read it](install.sh) before piping it to bash. From a clone,
+`./install.sh` does the same thing, and `make install` only symlinks the command.
 
 ## Use
 
