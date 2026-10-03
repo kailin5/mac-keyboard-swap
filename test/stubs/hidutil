@@ -1,0 +1,32 @@
+#!/bin/bash
+# Fake hidutil for tests. Pretends exactly one keyboard, $STUB_VID:$STUB_PID, is connected
+# (set STUB_CONNECTED=0 to unplug it), and remembers the last UserKeyMapping set on it.
+set -euo pipefail
+STATE="${STUB_DIR:?}/live"
+echo "hidutil $*" >> "$STUB_DIR/calls"
+
+connected() { [ "${STUB_CONNECTED:-1}" = 1 ]; }
+row() {
+  printf 'Services:\nVendorID ProductID LocationID UsagePage Usage RegistryID  Transport Class Product UserClass Built-In\n'
+  printf '0x%x 0x%x 0x2100000 1 6 0x100057d9a USB AppleUserHIDEventService Test Keyboard AppleUserHIDEventDriver 0\n' "$STUB_VID" "$STUB_PID"
+  printf '\nDevices:\n'
+}
+
+case "$1" in
+  list)
+    if connected && { [ "$3" = '{"PrimaryUsagePage":1,"PrimaryUsage":6}' ] \
+        || [ "$3" = "{\"VendorID\":$STUB_VID,\"ProductID\":$STUB_PID}" ]; }; then row
+    else printf 'Services:\nVendorID ProductID\n\nDevices:\n'; fi ;;
+  property)
+    if [ "$4" = --set ]; then
+      echo "$5" > "$STATE"
+    else
+      echo "RegistryID  Key                   Value"
+      [ -f "$STATE" ] || { echo "100057d9a   UserKeyMapping   (null)"; exit 0; }
+      echo "100057d9a   UserKeyMapping   ("
+      grep -o '"HIDKeyboardModifierMappingSrc":[0-9]*,"HIDKeyboardModifierMappingDst":[0-9]*' "$STATE" \
+        | awk -F'[:,]' '{ print "    {"; print "        HIDKeyboardModifierMappingDst = " $4 ";"
+                          print "        HIDKeyboardModifierMappingSrc = " $2 ";"; print "    }," }'
+      echo ")"
+    fi ;;
+esac

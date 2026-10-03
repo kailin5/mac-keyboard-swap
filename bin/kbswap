@@ -1,0 +1,374 @@
+#!/bin/bash
+# kbswap — give Windows-layout keyboards the Mac modifier layout by swapping
+# Alt<->Command and Win<->Option, per keyboard, using macOS's own per-keyboard
+# modifier mapping (the same setting as System Settings > Keyboard > Modifier Keys).
+# No driver, no daemon, no Input Monitoring permission.
+#
+# Compatible with the stock /bin/bash 3.2 on macOS.
+set -euo pipefail
+
+VERSION=0.1.0
+
+STATE_DIR="${KBSWAP_STATE_DIR:-$HOME/.config/kbswap}"
+MANAGED="$STATE_DIR/managed"          # one "vid-pid" per line, decimal
+BACKUP_DIR="$STATE_DIR/backup"        # pre-existing mappings we replaced
+DOMAIN="${KBSWAP_DOMAIN:--g}"         # overridable so tests never touch the real global domain
+PLISTBUDDY="${KBSWAP_PLISTBUDDY:-/usr/libexec/PlistBuddy}"
+DRY_RUN=0
+
+# HID keyboard usages as macOS stores them: (0x07 << 32) | usage
+L_ALT=30064771298   # 0xE2 Left Alt / Option
+L_GUI=30064771299   # 0xE3 Left Win / Command
+R_ALT=30064771302   # 0xE6 Right Alt / Option
+R_GUI=30064771303   # 0xE7 Right Win / Command
+
+TMP=""
+cleanup() { if [ -n "$TMP" ]; then rm -rf "$TMP"; fi; }
+trap cleanup EXIT
+
+die()  { echo "kbswap: $*" >&2; exit 1; }
+info() { echo "$*"; }
+
+run() {
+  if [ "$DRY_RUN" = 1 ]; then echo "+ $*"; else "$@"; fi
+}
+
+# Created in main(), not lazily: helpers run in $(...) subshells and could not set it.
+tmpdir() { echo "$TMP"; }
+
+# --- ids -------------------------------------------------------------------
+
+# parse_id "1133:50475" | "0x46d:0xc52b" | "1133-50475" -> "1133 50475"
+parse_id() {
+  local raw="$1" v p
+  case "$raw" in
+    *:*) v=${raw%%:*}; p=${raw#*:} ;;
+    *-*) v=${raw%%-*}; p=${raw#*-} ;;
+    *) die "bad keyboard id '$raw' (expected VID:PID, e.g. 1133:50475 or 0x46d:0xc52b)" ;;
+  esac
+  for n in "$v" "$p"; do
+    case "$n" in
+      0x*|0X*) [[ "${n:2}" =~ ^[0-9a-fA-F]+$ ]] || die "bad hex number '$n'" ;;
+      *) [[ "$n" =~ ^[0-9]+$ ]] || die "bad number '$n'" ;;
+    esac
+  done
+  printf '%d %d\n' "$v" "$p"
+}
+
+pref_key() { echo "com.apple.keyboard.modifiermapping.$1-$2-0"; }
+
+# --- mapping representations --------------------------------------------------
+# A mapping is handled internally as sorted "src dst" lines, identity entries dropped
+# (System Settings stores unchanged keys as src == dst).
+
+swap_pairs() {
+  printf '%s %s\n' "$L_ALT" "$L_GUI" "$L_GUI" "$L_ALT" "$R_ALT" "$R_GUI" "$R_GUI" "$R_ALT" | sort
+}
+
+# plist XML (as printed by PlistBuddy -x) on stdin -> pairs
+pairs_from_xml() {
+  awk '
+    /<key>HIDKeyboardModifierMappingSrc<\/key>/ { k = "s"; next }
+    /<key>HIDKeyboardModifierMappingDst<\/key>/ { k = "d"; next }
+    /<integer>/ { v = $0; gsub(/.*<integer>|<\/integer>.*/, "", v)
+                  if (k == "s") s = v; else if (k == "d") d = v; k = "" }
+    /<\/dict>/  { if (s != "" && s != d) print s, d; s = ""; d = "" }
+  ' | sort -u
+}
+
+# `hidutil property --get UserKeyMapping` output on stdin -> pairs (all services merged)
+pairs_from_hidutil() {
+  awk '
+    /HIDKeyboardModifierMappingSrc/ { v = $0; gsub(/.*= *|;.*/, "", v); s = v }
+    /HIDKeyboardModifierMappingDst/ { v = $0; gsub(/.*= *|;.*/, "", v); d = v }
+    /}/ { if (s != "" && s != d) print s, d; s = ""; d = "" }
+  ' | sort -u
+}
+
+xml_from_pairs() {
+  local out="<array>" s d
+  while read -r s d; do
+    [ -n "$s" ] || continue
+    out="$out<dict><key>HIDKeyboardModifierMappingSrc</key><integer>$s</integer><key>HIDKeyboardModifierMappingDst</key><integer>$d</integer></dict>"
+  done
+  echo "$out</array>"
+}
+
+json_from_pairs() {
+  local out="" s d
+  while read -r s d; do
+    [ -n "$s" ] || continue
+    [ -z "$out" ] || out="$out,"
+    out="$out{\"HIDKeyboardModifierMappingSrc\":$s,\"HIDKeyboardModifierMappingDst\":$d}"
+  done
+  echo "{\"UserKeyMapping\":[$out]}"
+}
+
+# --- saved (persistent) state -------------------------------------------------
+
+export_domain() {
+  TMP=$(mktemp -d "${TMPDIR:-/tmp}/kbswap.XXXXXX")
+  local f
+  f="$(tmpdir)/domain.plist"
+  defaults -currentHost export "$DOMAIN" "$f" 2>/dev/null || : > "$f"
+  echo "$f"
+}
+
+# Raw XML array of the saved mapping for a key; empty if absent.
+saved_xml() {
+  local f
+  f=$(export_domain)
+  [ -s "$f" ] || return 0
+  "$PLISTBUDDY" -x -c "Print :$1" "$f" 2>/dev/null | sed -n '/^<array>/,/^<\/array>/p' || true
+}
+
+saved_pairs() { saved_xml "$1" | pairs_from_xml; }
+
+saved_keys() {
+  defaults -currentHost read "$DOMAIN" 2>/dev/null \
+    | sed -n 's/^ *"com\.apple\.keyboard\.modifiermapping\.\([0-9]*\)-\([0-9]*\)-0".*/\1 \2/p'
+}
+
+# --- live state ---------------------------------------------------------------
+
+matching() { echo "{\"VendorID\":$1,\"ProductID\":$2}"; }
+
+is_connected() {
+  hidutil list --matching "$(matching "$1" "$2")" 2>/dev/null \
+    | awk '/^Services:/ { s = 1; getline; next } /^Devices:/ { s = 0 } s && NF > 3 { found = 1 } END { exit !found }'
+}
+
+live_pairs() {
+  hidutil property --matching "$(matching "$1" "$2")" --get UserKeyMapping 2>/dev/null | pairs_from_hidutil
+}
+
+apply_live() { # vid pid json
+  if [ "$DRY_RUN" = 1 ]; then run hidutil property --matching "$(matching "$1" "$2")" --set "$3"
+  else hidutil property --matching "$(matching "$1" "$2")" --set "$3" >/dev/null; fi
+}
+
+# "vid pid transport product" for each connected keyboard (hex ids converted)
+connected_keyboards() {
+  hidutil list --matching '{"PrimaryUsagePage":1,"PrimaryUsage":6}' 2>/dev/null | awk '
+    /^Services:/ { s = 1; getline; next }
+    /^Devices:/  { s = 0 }
+    s && NF >= 11 {
+      prod = $9; for (i = 10; i <= NF - 2; i++) prod = prod " " $i
+      print $1, $2, $7, prod
+    }' | while read -r v p t prod; do
+      [ "$v" != "0x0" ] || continue
+      printf '%d %d %s %s\n' "$v" "$p" "$t" "$prod"
+    done | sort -u -k1,2
+}
+
+# --- managed list -------------------------------------------------------------
+
+is_managed() { [ -f "$MANAGED" ] && grep -qx "$1-$2" "$MANAGED"; }
+
+add_managed() {
+  is_managed "$1" "$2" && return 0
+  run mkdir -p "$STATE_DIR"
+  if [ "$DRY_RUN" = 1 ]; then echo "+ echo $1-$2 >> $MANAGED"; else echo "$1-$2" >> "$MANAGED"; fi
+}
+
+remove_managed() {
+  [ -f "$MANAGED" ] || return 0
+  if [ "$DRY_RUN" = 1 ]; then echo "+ remove $1-$2 from $MANAGED"; return 0; fi
+  grep -vx "$1-$2" "$MANAGED" > "$MANAGED.tmp" || true
+  mv "$MANAGED.tmp" "$MANAGED"
+}
+
+managed_ids() { [ -f "$MANAGED" ] && tr '-' ' ' < "$MANAGED" || true; }
+
+describe_pairs() { # pairs on stdin -> "default" | "Alt/Win swapped" | "custom"
+  local p
+  p=$(cat)
+  if [ -z "$p" ]; then echo "default"
+  elif [ "$p" = "$(swap_pairs)" ]; then echo "Alt/Win swapped"
+  else echo "custom mapping"; fi
+}
+
+# --- commands -----------------------------------------------------------------
+
+cmd_list() {
+  local v p t prod tag seen=" "
+  info "Connected keyboards:"
+  while read -r v p t prod; do
+    [ -n "$v" ] || continue
+    seen="$seen$v-$p "
+    tag=$(saved_pairs "$(pref_key "$v" "$p")" | describe_pairs)
+    is_managed "$v" "$p" && tag="$tag, managed by kbswap"
+    printf '  %-13s %-10s %-28s %s\n' "$v:$p" "$t" "$prod" "$tag"
+  done <<EOF
+$(connected_keyboards)
+EOF
+  [ "$seen" != " " ] || info "  (none)"
+
+  local header=0
+  while read -r v p; do
+    [ -n "$v" ] || continue
+    case "$seen" in *" $v-$p "*) continue ;; esac
+    [ $header = 1 ] || { info ""; info "Saved mappings for keyboards not connected now:"; header=1; }
+    tag=$(saved_pairs "$(pref_key "$v" "$p")" | describe_pairs)
+    is_managed "$v" "$p" && tag="$tag, managed by kbswap"
+    printf '  %-13s %s\n' "$v:$p" "$tag"
+  done <<EOF
+$(saved_keys)
+EOF
+}
+
+cmd_enable() {
+  local id="" ids force=0 v p key existing
+  for a in "$@"; do
+    case "$a" in --force) force=1 ;; -*) die "enable: unknown option $a" ;; *) id="$a" ;; esac
+  done
+  [ -n "$id" ] || die "usage: kbswap enable VID:PID [--force]   (see: kbswap list)"
+  ids=$(parse_id "$id") || exit 1
+  read -r v p <<< "$ids"
+  key=$(pref_key "$v" "$p")
+  existing=$(saved_pairs "$key")
+
+  if [ "$existing" = "$(swap_pairs)" ]; then
+    info "$v:$p already has the Alt/Win swap saved."
+  else
+    if [ -n "$(saved_xml "$key")" ] && [ ! -f "$BACKUP_DIR/$v-$p.xml" ]; then
+      if [ -n "$existing" ] && [ $force = 0 ]; then
+        die "$v:$p already has a custom mapping (set in System Settings?). Re-run with --force to replace it; the old mapping is backed up and restored by 'kbswap disable'."
+      fi
+      run mkdir -p "$BACKUP_DIR"
+      if [ "$DRY_RUN" = 1 ]; then echo "+ back up $key to $BACKUP_DIR/$v-$p.xml"
+      else saved_xml "$key" > "$BACKUP_DIR/$v-$p.xml"; fi
+    fi
+    run defaults -currentHost write "$DOMAIN" "$key" "$(swap_pairs | xml_from_pairs)"
+    info "Saved Alt/Win swap for $v:$p."
+  fi
+  add_managed "$v" "$p"
+
+  if is_connected "$v" "$p"; then
+    apply_live "$v" "$p" "$(swap_pairs | json_from_pairs)"
+    info "Applied now (keyboard is connected)."
+  else
+    info "Keyboard not connected; macOS applies the swap when it connects."
+  fi
+}
+
+cmd_disable() {
+  local id="" ids force=0 v p key backup restore
+  for a in "$@"; do
+    case "$a" in --force) force=1 ;; -*) die "disable: unknown option $a" ;; *) id="$a" ;; esac
+  done
+  [ -n "$id" ] || die "usage: kbswap disable VID:PID [--force]"
+  ids=$(parse_id "$id") || exit 1
+  read -r v p <<< "$ids"
+  key=$(pref_key "$v" "$p")
+  if ! is_managed "$v" "$p" && [ $force = 0 ]; then
+    die "$v:$p is not managed by kbswap. Use --force to remove its saved mapping anyway."
+  fi
+
+  backup="$BACKUP_DIR/$v-$p.xml"
+  if [ -f "$backup" ]; then
+    run defaults -currentHost write "$DOMAIN" "$key" "$(cat "$backup")"
+    restore=$(pairs_from_xml < "$backup")
+    run rm -f "$backup"
+    info "Restored the mapping $v:$p had before kbswap."
+  else
+    if [ -n "$(saved_xml "$key")" ]; then run defaults -currentHost delete "$DOMAIN" "$key"; fi
+    restore=""
+    info "Removed the saved mapping for $v:$p."
+  fi
+  remove_managed "$v" "$p"
+
+  if is_connected "$v" "$p"; then
+    apply_live "$v" "$p" "$(printf '%s\n' "$restore" | json_from_pairs)"
+    info "Applied now."
+  fi
+}
+
+cmd_apply() {
+  local v p n=0
+  while read -r v p; do
+    [ -n "$v" ] || continue
+    if is_connected "$v" "$p"; then
+      apply_live "$v" "$p" "$(saved_pairs "$(pref_key "$v" "$p")" | json_from_pairs)"
+      info "Applied $v:$p."; n=$((n + 1))
+    fi
+  done <<EOF
+$(managed_ids)
+EOF
+  [ $n -gt 0 ] || info "No managed keyboards connected."
+}
+
+cmd_doctor() {
+  local v p fail=0 any=0 expected
+  expected=$(swap_pairs)
+  while read -r v p; do
+    [ -n "$v" ] || continue
+    any=1
+    if [ "$(saved_pairs "$(pref_key "$v" "$p")")" = "$expected" ]; then
+      info "ok    $v:$p saved swap present"
+    else
+      info "FAIL  $v:$p saved swap missing or changed (fix: kbswap enable $v:$p)"; fail=1
+    fi
+    if ! is_connected "$v" "$p"; then
+      info "skip  $v:$p not connected, live state not checked"
+    elif [ "$(live_pairs "$v" "$p")" = "$expected" ]; then
+      info "ok    $v:$p swap active now"
+    else
+      info "FAIL  $v:$p connected but swap not active (fix: kbswap apply, or replug)"; fail=1
+    fi
+  done <<EOF
+$(managed_ids)
+EOF
+  [ $any = 1 ] || info "No keyboards managed by kbswap. See: kbswap list"
+  return $fail
+}
+
+cmd_uninstall() {
+  local v p
+  while read -r v p; do
+    [ -n "$v" ] || continue
+    cmd_disable "$v:$p"
+  done <<EOF
+$(managed_ids)
+EOF
+  if [ -d "$STATE_DIR" ]; then run rm -rf "$STATE_DIR"; fi
+  info "kbswap state removed. Delete the kbswap command itself to finish."
+}
+
+usage() {
+  cat <<EOF
+kbswap $VERSION — Mac modifier layout for Windows-layout keyboards, per keyboard.
+
+Usage: kbswap [--dry-run] <command> [args]
+
+Commands:
+  list                       Show connected keyboards (VID:PID) and their saved mappings
+  enable VID:PID [--force]   Swap Alt<->Command and Win<->Option on that keyboard
+  disable VID:PID [--force]  Undo; restores any mapping kbswap replaced
+  apply                      Re-apply saved swaps to connected keyboards right now
+  doctor                     Check saved and live state; exits non-zero on problems
+  uninstall                  Disable every managed keyboard and remove kbswap state
+
+IDs accept decimal (1133:50475) or hex (0x46d:0xc52b).
+EOF
+}
+
+main() {
+  TMP=$(mktemp -d "${TMPDIR:-/tmp}/kbswap.XXXXXX")
+  if [ "${1:-}" = "--dry-run" ]; then DRY_RUN=1; shift; fi
+  local cmd="${1:-help}"
+  [ $# -eq 0 ] || shift
+  case "$cmd" in
+    list) cmd_list ;;
+    enable) cmd_enable "$@" ;;
+    disable) cmd_disable "$@" ;;
+    apply) cmd_apply ;;
+    doctor) cmd_doctor ;;
+    uninstall) cmd_uninstall ;;
+    version|--version) echo "kbswap $VERSION" ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"
